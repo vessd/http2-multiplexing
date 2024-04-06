@@ -9,8 +9,7 @@ use bytes::Bytes;
 use clap::Parser;
 use h2::client::{self, SendRequest};
 use http::Request;
-use http2_multiplexing::{Message, MessageType};
-use thiserror::Error;
+use http2_multiplexing::{Error, Message, MessageType};
 use tokio::{net::TcpStream, task::JoinSet};
 
 #[derive(Parser)]
@@ -126,18 +125,6 @@ async fn main_task(cli: Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Error)]
-enum Error {
-    #[error("Ошибка HTTP2")]
-    H2(#[from] h2::Error),
-    #[error("Ошибка (де)сереализации")]
-    Bincode(#[from] bincode::Error),
-    #[error("Буфер слишком маленький")]
-    BufferSize(usize),
-    #[error("Неверный тип сообщения")]
-    BadMessage(usize),
-}
-
 async fn send_request(id: usize, client: SendRequest<Bytes>) -> Result<Duration, Error> {
     let mut buf = ArrayVec::<u8, 16>::new();
     let message = Message {
@@ -162,7 +149,7 @@ async fn send_request(id: usize, client: SendRequest<Bytes>) -> Result<Duration,
         if buf.len() + len <= buf.capacity() {
             buf.extend(data);
         } else {
-            return Err(Error::BufferSize(id));
+            return Err(Error::BufferSize(Some(id)));
         }
         let _ = body.flow_control().release_capacity(len);
     }

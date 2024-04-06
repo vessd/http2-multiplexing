@@ -14,7 +14,7 @@ use h2::{
     RecvStream,
 };
 use http::Request;
-use http2_multiplexing::{Message, MessageType};
+use http2_multiplexing::{Error, Message, MessageType};
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::Semaphore,
@@ -90,18 +90,14 @@ impl ServerMetrics {
         }
     }
 
-    fn push(&mut self, client_result: Result<Result<Duration, h2::Error>, JoinError>) {
+    fn push(&mut self, client_result: Result<Result<Duration, Error>, JoinError>) {
         match client_result {
             Ok(Ok(duration)) => self.client_time.push(duration),
-            Ok(Err(err)) => {
-                let io_kind = err.get_io().map(|io| io.kind());
-                if matches!(io_kind, Some(std::io::ErrorKind::BrokenPipe)) {
-                    self.client_timeout += 1;
-                } else {
-                    tracing::error!("Ошибка при обработки соединения {}", err.to_string());
-                }
-            }
-            Err(err) => tracing::error!("Паника при обработки соединения {}", err.to_string()),
+            Ok(Err(err)) => match err {
+                Error::ClientTimeout => self.client_timeout += 1,
+                _ => tracing::error!("Ошибка при обработки соединения {:?}", err),
+            },
+            Err(err) => tracing::error!("Паника при обработки соединения {:?}", err),
         }
     }
 
@@ -138,7 +134,7 @@ async fn main_task(cli: Cli) -> anyhow::Result<()> {
     tracing::info!("Сервер начал слушать адрес {}", cli.listen_address);
 
     let mut mertrics = ServerMetrics::new();
-    let mut connection_set: JoinSet<Result<Duration, h2::Error>> = JoinSet::new();
+    let mut connection_set: JoinSet<Result<Duration, Error>> = JoinSet::new();
     let token = CancellationToken::new();
     let connection_control = Arc::new(Semaphore::new(cli.connection_limit));
 
@@ -147,10 +143,7 @@ async fn main_task(cli: Cli) -> anyhow::Result<()> {
         let token = token.clone();
         tokio::spawn(async move {
             if let Err(err) = tokio::signal::ctrl_c().await {
-                tracing::error!(
-                    error = err.to_string(),
-                    "Не удалось подписаться на сигнал SIGINT"
-                );
+                tracing::error!("Не удалось подписаться на сигнал SIGINT: {:?}", err);
             }
             tracing::info!("Получен сигнал SIGINT");
             token.cancel();
@@ -207,11 +200,11 @@ impl ClientMetrics {
         }
     }
 
-    fn push(&mut self, request_result: Result<anyhow::Result<Duration>, JoinError>) {
+    fn push(&mut self, request_result: Result<Result<Duration, Error>, JoinError>) {
         match request_result {
             Ok(Ok(duration)) => self.request_time.push(duration),
-            Ok(Err(err)) => tracing::error!("Ошибка при обработки запроса {}", err.to_string()),
-            Err(err) => tracing::error!("Паника при обработки запроса {}", err.to_string()),
+            Ok(Err(err)) => tracing::error!("Ошибка при обработки запроса {:?}", err),
+            Err(err) => tracing::error!("Паника при обработки запроса {:?}", err),
         }
     }
 
@@ -246,7 +239,7 @@ async fn serve(
     addr: SocketAddr,
     connection_control: Arc<Semaphore>,
     token: CancellationToken,
-) -> Result<Duration, h2::Error> {
+) -> Result<Duration, Error> {
     let mut metrics = ClientMetrics::new(addr);
     let _permit = connection_control
         .acquire()
@@ -254,7 +247,7 @@ async fn serve(
         .expect("connection_control");
 
     let mut connection = server::handshake(socket).await?;
-    let mut request_set: JoinSet<anyhow::Result<Duration>> = JoinSet::new();
+    let mut request_set: JoinSet<Result<Duration, Error>> = JoinSet::new();
 
     loop {
         tokio::select! {
@@ -262,6 +255,11 @@ async fn serve(
                 break;
             }
             Some(result) = request_set.join_next() => {
+                if let Ok(Err(Error::H2(err))) = result.as_ref() {
+                    if !(err.is_io() || err.reason().is_some()) {
+                        return Err(Error::ClientTimeout);
+                    }
+                }
                 metrics.push(result);
             }
             request = connection.accept() => {
@@ -274,8 +272,7 @@ async fn serve(
                             let io_err = err.get_io().unwrap();
                             match io_err.kind() {
                                 std::io::ErrorKind::BrokenPipe => {
-                                    // клиент не дождался очереди
-                                    return Err(err);
+                                    return Err(Error::ClientTimeout);
                                 }
                                 std::io::ErrorKind::NotConnected => {
                                     // клиент бросил соединение ?
@@ -301,6 +298,13 @@ async fn serve(
 
     // Ждём завершения обработки уже принятых запросов
     while let Some(result) = request_set.join_next().await {
+        if metrics.request_time.is_empty() {
+            if let Ok(Err(Error::H2(err))) = result.as_ref() {
+                if !(err.is_io() || err.reason().is_some()) {
+                    return Err(Error::ClientTimeout);
+                }
+            }
+        }
         metrics.push(result);
     }
 
@@ -310,25 +314,25 @@ async fn serve(
 async fn handle_request(
     mut request: Request<RecvStream>,
     mut respond: SendResponse<Bytes>,
-) -> anyhow::Result<Duration> {
+) -> Result<Duration, Error> {
     let mut buf = ArrayVec::<u8, 16>::new();
     let start_time = Instant::now();
     let body = request.body_mut();
 
     while let Some(data) = body.data().await {
-        let data = data.context("Не удалось извлечь данные")?;
+        let data = data?;
         let len = data.len();
         if buf.len() + len <= buf.capacity() {
             buf.extend(data);
         } else {
-            anyhow::bail!("Буфер слишком маленьний");
+            return Err(Error::BufferSize(None));
         }
         let _ = body.flow_control().release_capacity(len);
     }
 
-    let mut message: Message = bincode::deserialize(&buf).context("Ошибка десериализации")?;
+    let mut message: Message = bincode::deserialize(&buf)?;
     if message.ty != MessageType::Ping {
-        anyhow::bail!("Неверный тип сообщения");
+        return Err(Error::BadMessage(message.id));
     }
 
     tokio::time::sleep(Duration::from_millis(fastrand::u16(100..=500) as u64)).await;
