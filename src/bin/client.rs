@@ -62,29 +62,37 @@ async fn main_task(cli: Cli) -> anyhow::Result<()> {
 
     let start_time = Instant::now();
 
-    let handshake = tokio::time::timeout(Duration::from_millis(50), client::handshake(tcp));
-    let (client, connection) = match handshake.await {
-        Ok(result) => result.context("HTTP/2 handshake")?,
-        Err(_) => {
-            tracing::info!("Время ожидания установки соединения истекло");
-            return Ok(());
-        }
-    };
-
+    let (client, connection) = client::handshake(tcp).await.context("HTTP/2 handshake")?;
     tokio::spawn(async move {
         if let Err(err) = connection.await {
             tracing::error!("Соединение разорвано: {}", err);
         }
     });
 
-    tracing::info!("Соединение установлено");
+    let mut request_time = Vec::new();
+
+    // 3.4. HTTP/2 Connection Preface
+    //
+    // To avoid unnecessary latency, clients are permitted to send additional
+    // frames to the server immediately after sending the client connection
+    // preface, without waiting to receive the server connection preface.
+    //
+    // Текущий API h2 не позволяет ждать подтверждения соединения от сервера.
+    // Ждём ответ на первый запрос.
+    match tokio::time::timeout(cli.connect_timeout, send_request(0, client.clone())).await {
+        Ok(Ok(duration)) => request_time.push(duration),
+        Ok(Err(err)) => tracing::error!("Ошибка при отправке запроса: {:?}", err),
+        Err(_) => {
+            tracing::info!("Время установки соединения истекло");
+            return Ok(());
+        }
+    }
 
     let mut request_set: JoinSet<Result<Duration, Error>> = JoinSet::new();
-    for id in 0..cli.count as usize {
+    for id in 1..cli.count as usize {
         request_set.spawn(send_request(id, client.clone()));
     }
 
-    let mut request_time = Vec::new();
     while let Some(result) = request_set.join_next().await {
         match result {
             Ok(Ok(duration)) => request_time.push(duration),
@@ -124,7 +132,7 @@ enum Error {
     H2(#[from] h2::Error),
     #[error("Ошибка (де)сереализации")]
     Bincode(#[from] bincode::Error),
-    #[error("Буфер слишком маленьний")]
+    #[error("Буфер слишком маленький")]
     BufferSize(usize),
     #[error("Неверный тип сообщения")]
     BadMessage(usize),

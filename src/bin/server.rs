@@ -93,7 +93,14 @@ impl ServerMetrics {
     fn push(&mut self, client_result: Result<Result<Duration, h2::Error>, JoinError>) {
         match client_result {
             Ok(Ok(duration)) => self.client_time.push(duration),
-            Ok(Err(err)) => tracing::error!("Ошибка при обработки соединения {}", err.to_string()),
+            Ok(Err(err)) => {
+                let io_kind = err.get_io().map(|io| io.kind());
+                if matches!(io_kind, Some(std::io::ErrorKind::BrokenPipe)) {
+                    self.client_timeout += 1;
+                } else {
+                    tracing::error!("Ошибка при обработки соединения {}", err.to_string());
+                }
+            }
             Err(err) => tracing::error!("Паника при обработки соединения {}", err.to_string()),
         }
     }
@@ -256,7 +263,6 @@ async fn serve(
             }
             Some(result) = request_set.join_next() => {
                 metrics.push(result);
-                tracing::trace!("request complete");
             }
             request = connection.accept() => {
                 match request {
@@ -265,13 +271,18 @@ async fn serve(
                     }
                     Some(Err(err)) => {
                         if err.is_io() {
-                            let err = err.into_io().unwrap();
-                            if err.kind() == std::io::ErrorKind::NotConnected {
-                                // клиент бросил соединение ?
-                                // странный баг, не смог разобраться
-                                // tracing::error!("Ошибка получения запроса: NotConnected");
-                            } else {
-                                tracing::error!("Ошибка получения запроса: {:?}", err);
+                            let io_err = err.get_io().unwrap();
+                            match io_err.kind() {
+                                std::io::ErrorKind::BrokenPipe => {
+                                    // клиент не дождался очереди
+                                    return Err(err);
+                                }
+                                std::io::ErrorKind::NotConnected => {
+                                    // клиент бросил соединение ?
+                                    // странный баг, не смог разобраться
+                                    // tracing::error!("Ошибка получения запроса: NotConnected");
+                                }
+                                _ => tracing::error!("Ошибка получения запроса: {:?}", err),
                             }
                         } else {
                             tracing::error!("Ошибка получения запроса: {:?}", err);
